@@ -1,0 +1,433 @@
+"""
+Pipeline chính: chạy detect+track -> OCR overlay theo giây (cache) -> đèn
+giao thông theo giây (cache) -> build event-timeline -> xuất JSON.
+
+HỖ TRỢ 2 CHẾ ĐỘ:
+  1) --video_path <file>      : chạy 1 video đơn (demo nhanh)
+  2) --video_dir <thư mục>    : chạy HÀNG LOẠT mọi video trong thư mục (dùng
+                                 trên Kaggle, xem notebook đi kèm) -- mỗi
+                                 video ra 1 file events/<video_id>.json,
+                                 video_id = tên file không đuôi.
+
+Chạy: python3 main_pipeline.py --video_dir /kaggle/input/traffic-videos --out_dir ./events
+"""
+from __future__ import annotations
+
+import argparse
+import dataclasses
+import glob
+import json
+import logging
+import math
+import os
+from typing import Dict, List, Optional
+
+import cv2
+
+from detect_track import run_detection_tracking
+from ocr_overlay import ocr_overlay, OverlayInfo
+from traffic_light import detect_light_color
+from event_timeline import build_events_from_tracks, detect_composite_events, Event
+from event_description import build_all_descriptions
+from vehicle_relations import detect_order_and_overtake, detect_collision_candidates, detect_side_by_side
+from zone_events import detect_pedestrian_crossing_outside_crosswalk, detect_vehicle_stopped_on_crosswalk
+from density_timeline import build_density_timeline, summarize_density
+from lane_direction import LaneDirectionModel, detect_wrong_way_vehicles
+from vehicle_type_refine import VehicleTypeRefiner, refine_vehicle_types
+from track_dedup import deduplicate_events
+from scene_description import build_scene_descriptions
+import config
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger("traffic_pipeline.main")
+
+VIDEO_EXTENSIONS = (".mp4", ".mov", ".avi", ".mkv", ".webm")
+
+
+def build_second_level_cache(video_path: str, duration_sec: float):
+    """OCR + đèn giao thông chỉ cần chạy 1 LẦN MỖI GIÂY (đồng hồ overlay chỉ
+    đổi theo giây, đèn không đổi màu quá nhanh) -- tiết kiệm rất nhiều so
+    với chạy trên mọi frame. Trả về 2 dict {giây_nguyên: giá_trị}.
+
+    LƯU Ý QUAN TRỌNG: vùng crop OCR/đèn trong config.py được ĐO CHO ĐÚNG 1
+    CAMERA (N001-V001.mov, 1920x1080, overlay+đèn ở vị trí cố định của
+    camera đó). Nếu video khác có overlay/đèn ở vị trí khác, các con số
+    trong config.py PHẢI được đo lại -- xem hướng dẫn ở đầu notebook."""
+    cap = cv2.VideoCapture(video_path)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+
+    ocr_cache: Dict[int, OverlayInfo] = {}
+    light_cache: Dict[int, str] = {}
+
+    n_seconds = int(math.ceil(duration_sec))
+    logger.info(f"Xây cache OCR + đèn giao thông cho {n_seconds} giây (1 frame/giây)...")
+
+    for sec in range(n_seconds):
+        cap.set(cv2.CAP_PROP_POS_FRAMES, int(sec * fps))
+        ok, frame = cap.read()
+        if not ok:
+            break
+        ocr_cache[sec] = ocr_overlay(frame)
+        light_cache[sec] = detect_light_color(frame)
+        if sec % 60 == 0:
+            logger.info(f"  đã OCR/đèn tới giây {sec}/{n_seconds}")
+
+    cap.release()
+    return ocr_cache, light_cache
+
+
+def make_lookups(ocr_cache: Dict[int, OverlayInfo], light_cache: Dict[int, str]):
+    def ocr_lookup(t: float) -> Optional[OverlayInfo]:
+        return ocr_cache.get(int(t))
+
+    def light_lookup(t: float) -> Optional[str]:
+        return light_cache.get(int(t))
+
+    return ocr_lookup, light_lookup
+
+
+def event_to_dict(e: Event) -> dict:
+    return dataclasses.asdict(e)
+
+
+def demo_queries(events, ocr_cache, duration_sec=None):
+    print("\n" + "=" * 70)
+    print("DEMO QUERY 1: lọc theo khoảng thời gian (giây 0-60) + loại xe")
+    print("=" * 70)
+    for e in events:
+        if e.t_start <= 60 and e.cls_name in ("car", "truck", "bus"):
+            print(f"  track={e.track_id:4d} class={e.cls_name:10s} color={e.vehicle_color} "
+                  f"[{e.t_start:6.1f}s - {e.t_end:6.1f}s] loc={e.location}")
+
+    print("\n" + "=" * 70)
+    print("DEMO QUERY 2: composite events (đèn đỏ, vượt đèn, dừng lâu, kẹt xe)")
+    print("=" * 70)
+    composites = detect_composite_events(events)
+    by_type = {}
+    for c in composites:
+        by_type.setdefault(c["event_type"], []).append(c)
+    for etype, items in by_type.items():
+        print(f"  [{etype}] tổng {len(items)}:")
+        for c in items[:5]:
+            loc = c.get("location") or "?"
+            print(f"    [{c['t_start']:6.1f}s - {c['t_end']:6.1f}s] tại {loc}")
+
+    if ocr_cache:
+        print("\n" + "=" * 70)
+        print("DEMO QUERY 3: OCR overlay đọc được ở vài mốc giây")
+        print("=" * 70)
+        for sec in sorted(ocr_cache.keys())[:5]:
+            info = ocr_cache[sec]
+            print(f"  giây {sec}: location={info.location!r} time={info.time_str!r}")
+
+    print("\n" + "=" * 70)
+    print("DEMO QUERY 4: mô tả tự nhiên sinh tự động (dùng để text-embedding)")
+    print("=" * 70)
+    from event_description import describe_event
+    for e in events[:5]:
+        print(f"  {describe_event(e)}")
+
+    print("\n" + "=" * 70)
+    print("DEMO QUERY 5: quan hệ giữa các xe (trước/sau, vượt, va chạm)")
+    print("=" * 70)
+    relations = detect_order_and_overtake(events)
+    overtakes = [r for r in relations if r["relation"] == "overtake"]
+    print(f"  Tổng {len(relations)} quan hệ trước/sau, trong đó {len(overtakes)} là 'vượt' (overtake):")
+    for r in overtakes[:10]:
+        print(f"    track {r['overtaker_track_id']} ({r['overtaker_cls']}) vượt "
+              f"track {r['overtaken_track_id']} ({r['overtaken_cls']}) lúc "
+              f"{r['t_start']:.1f}s-{r['t_end']:.1f}s")
+    collisions = detect_collision_candidates(events)
+    print(f"  Ứng viên va chạm (CẦN xem lại bằng mắt): {len(collisions)}")
+    for c in collisions[:5]:
+        print(f"    track {c['track_id_1']} ({c['cls_1']}) & track {c['track_id_2']} ({c['cls_2']}) lúc {c['t']:.1f}s")
+
+    from vehicle_relations import detect_side_by_side
+    side_by_side = detect_side_by_side(events)
+    print(f"  Xe đi cạnh nhau (side-by-side): {len(side_by_side)}")
+    for s in side_by_side[:5]:
+        print(f"    trái=track {s['left_track_id']} ({s['left_cls']}) / phải=track {s['right_track_id']} "
+              f"({s['right_cls']}) lúc {s['t_start']:.1f}s-{s['t_end']:.1f}s")
+
+    from scene_description import build_scene_descriptions
+    scenes = build_scene_descriptions(events, light_lookup=None, side_by_side=side_by_side, order_relations=relations)
+    print(f"  Mô tả cảnh gộp nhiều xe (scene description): {len(scenes)}")
+    for s in scenes[:5]:
+        print(f"    [{s['t']:.1f}s] {s['description']}")
+
+    print("\n" + "=" * 70)
+    print("DEMO QUERY 6: sự kiện theo vùng (băng qua sai vạch, dừng đè vạch)")
+    print("=" * 70)
+    ped_out = detect_pedestrian_crossing_outside_crosswalk(events, config.CROSSWALK_POLYGON)
+    veh_stop = detect_vehicle_stopped_on_crosswalk(events, config.CROSSWALK_POLYGON)
+    print(f"  Người đi bộ băng qua ngoài vạch: {len(ped_out)}")
+    for p in ped_out[:5]:
+        print(f"    track {p['track_id']} lúc {p['t_start']:.1f}s-{p['t_end']:.1f}s (trong vạch: {p['fraction_in_crosswalk']*100:.0f}%)")
+    print(f"  Xe dừng đè vạch: {len(veh_stop)}")
+    for v in veh_stop[:5]:
+        print(f"    track {v['track_id']} ({v['cls_name']}) lúc {v['t_start']:.1f}s-{v['t_end']:.1f}s")
+
+    print("\n" + "=" * 70)
+    print("DEMO QUERY 7: xe đi sai làn/ngược chiều (tự học hướng từ đa số xe)")
+    print("=" * 70)
+    lane_model = LaneDirectionModel()
+    lane_model.fit(events)
+    wrong_way = detect_wrong_way_vehicles(events, lane_model=lane_model)
+    print(f"  Đã học được hướng đa số tin cậy cho {lane_model.n_reliable_cells()} ô lưới.")
+    print(f"  Ứng viên đi sai làn/ngược chiều (CẦN xem lại bằng mắt): {len(wrong_way)}")
+    for w in wrong_way[:5]:
+        print(f"    track {w['track_id']} ({w['cls_name']}) lúc {w['t_start']:.1f}s-{w['t_end']:.1f}s "
+              f"lệch {w['avg_angle_deg']}° trên {w['n_checked']} đoạn quỹ đạo")
+
+    if duration_sec:
+        print("\n" + "=" * 70)
+        print("DEMO QUERY 8: mật độ giao thông theo thời gian (bucket 10s)")
+        print("=" * 70)
+        timeline = build_density_timeline(events, duration_sec, bucket_sec=10.0)
+        summary = summarize_density(timeline)
+        if summary:
+            b = summary["busiest_window"]
+            q = summary["quietest_window"]
+            print(f"  Đông nhất: {b['t_start']:.0f}s-{b['t_end']:.0f}s ({b['n_total']} đối tượng, "
+                  f"{b['n_vehicles']} xe + {b['n_persons']} người)")
+            print(f"  Vắng nhất: {q['t_start']:.0f}s-{q['t_end']:.0f}s ({q['n_total']} đối tượng)")
+            print(f"  Trung bình: {summary['avg_vehicles_per_window']:.1f} đối tượng/khoảng 10s")
+
+    print("\n" + "=" * 70)
+    print("DEMO QUERY 9: màu áo người đi bộ / người ngồi xe máy (person_pose.py)")
+    print("=" * 70)
+    n_shirt = sum(1 for e in events if getattr(e, "shirt_color", None))
+    n_person_or_2wheeler = sum(1 for e in events if e.cls_name in ("person", "motorcycle", "bicycle"))
+    print(f"  Xác định được màu áo cho {n_shirt}/{n_person_or_2wheeler} track người/xe 2 bánh "
+          f"(số còn lại: không đủ keypoint tin cậy, hoặc confidence màu dưới ngưỡng -- xem person_pose.py).")
+    for e in events:
+        if getattr(e, "shirt_color", None):
+            who = "người đi bộ" if e.cls_name == "person" else f"người lái {e.cls_name}"
+            print(f"    track {e.track_id} ({who}): áo màu {e.shirt_color} (conf={e.shirt_color_conf})")
+
+
+_COLOR_CLASSIFIER = None  # cache toàn cục -- load model màu xe 1 lần cho mọi video
+_TYPE_REFINER = None      # cache toàn cục -- load model YOLOE (loại xe chi tiết) 1 lần cho mọi video
+_POSE_ESTIMATOR = None    # cache toàn cục -- load model YOLO-pose (vùng áo) 1 lần cho mọi video
+
+
+def _get_color_classifier():
+    global _COLOR_CLASSIFIER
+    if not config.ENABLE_VEHICLE_COLOR:
+        return None
+    if _COLOR_CLASSIFIER is None:
+        from vehicle_color import VehicleColorClassifier
+        logger.info("Đang load model màu xe (tự động dùng fallback HSV nếu model lỗi/thiếu)...")
+        _COLOR_CLASSIFIER = VehicleColorClassifier(model_path=config.VEHICLE_COLOR_MODEL_PATH)
+    return _COLOR_CLASSIFIER
+
+
+def _get_pose_estimator():
+    global _POSE_ESTIMATOR
+    if not getattr(config, "ENABLE_SHIRT_COLOR", True):
+        return None
+    if _POSE_ESTIMATOR is None:
+        from person_pose import PersonPoseEstimator
+        logger.info("Đang load model YOLO-pose (xác định vùng áo cho người đi bộ/người ngồi xe máy)...")
+        _POSE_ESTIMATOR = PersonPoseEstimator(model_name=getattr(config, "POSE_MODEL_NAME", "yolov8s-pose.pt"))
+    return _POSE_ESTIMATOR
+
+
+def _get_type_refiner():
+    global _TYPE_REFINER
+    if not getattr(config, "ENABLE_VEHICLE_TYPE_DETAIL", True):
+        return None
+    if _TYPE_REFINER is None:
+        logger.info("Đang load model YOLOE (nhận diện loại xe chi tiết -- ambulance/xe ba gác/...)...")
+        _TYPE_REFINER = VehicleTypeRefiner()
+    return _TYPE_REFINER
+
+
+def process_one_video(video_path: str, out_dir: str, max_frames: Optional[int], stride: int,
+                       show_demo: bool = False) -> str:
+    """Chạy toàn bộ pipeline cho 1 video, ghi ra out_dir/<video_id>.json.
+    Trả về đường dẫn file JSON đã ghi."""
+    video_id = os.path.splitext(os.path.basename(video_path))[0]
+    out_path = os.path.join(out_dir, f"{video_id}.json")
+
+    cap = cv2.VideoCapture(video_path)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    total_frames = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+    duration_sec = total_frames / fps if fps > 0 else 0
+    cap.release()
+    logger.info(f"[{video_id}] {duration_sec:.1f}s, {fps:.1f}fps -- bắt đầu xử lý...")
+
+    if max_frames is not None:
+        duration_for_cache = min(duration_sec, max_frames * stride / fps + 5)
+    else:
+        duration_for_cache = duration_sec
+
+    logger.info(f"[{video_id}] BƯỚC 1: Detection + Tracking (YOLOv8 + ByteTrack)")
+    detections = run_detection_tracking(video_path=video_path, max_frames=max_frames, frame_stride=stride)
+
+    logger.info(f"[{video_id}] BƯỚC 2: OCR overlay + đèn giao thông (cache theo giây)")
+    ocr_cache, light_cache = build_second_level_cache(video_path, duration_for_cache)
+    ocr_lookup, light_lookup = make_lookups(ocr_cache, light_cache)
+
+    logger.info(f"[{video_id}] BƯỚC 3: Build event-timeline từ track")
+    color_classifier = _get_color_classifier()
+    pose_estimator = _get_pose_estimator()
+    # frame_reader: đọc lại đúng frame gốc theo frame_idx (frame_idx đã tính
+    # theo stride khi detect+track, xem detect_track.py -- timestamp =
+    # frame_idx * stride / fps, nên frame thật trong video tương ứng nằm ở
+    # vị trí frame_idx * stride). Dùng CHUNG 1 VideoCapture (mở 1 lần, seek
+    # nhiều lần) thay vì mở lại mỗi lần gọi -- frame_reader được gọi khá
+    # nhiều lần (chấm điểm chất lượng top-8 detection/track + nhận diện màu
+    # xe), mở lại VideoCapture mỗi lần sẽ chậm đáng kể trên video dài.
+    _cap_shared = cv2.VideoCapture(video_path)
+
+    def _frame_reader(frame_idx: int):
+        _cap_shared.set(cv2.CAP_PROP_POS_FRAMES, frame_idx * stride)
+        ok, frame = _cap_shared.read()
+        return frame if ok else None
+
+    events = build_events_from_tracks(
+        detections, video_id=video_id, ocr_lookup=ocr_lookup, light_lookup=light_lookup,
+        frame_reader=_frame_reader, color_classifier=color_classifier, pose_estimator=pose_estimator,
+    )
+
+    logger.info(f"[{video_id}] BƯỚC 3-dedup: Lọc track trùng lặp (cùng 1 vật thể bị track nhầm nhiều lần -- "
+                f"xem track_dedup.py, phổ biến với vật đứng yên lâu)")
+    n_before_dedup = len(events)
+    events = deduplicate_events(events)
+    if len(events) != n_before_dedup:
+        logger.info(f"[{video_id}] Đã gộp {n_before_dedup - len(events)} track trùng lặp "
+                    f"({n_before_dedup} -> {len(events)}).")
+
+    logger.info(f"[{video_id}] BƯỚC 3a: Nhận diện loại xe chi tiết (YOLOE open-vocabulary, "
+                f"chỉ chạy 1 lần/track trên frame đại diện tốt nhất, không chạy toàn video)")
+    type_refiner = _get_type_refiner()
+    if type_refiner is not None:
+        n_types = refine_vehicle_types(events, type_refiner, _frame_reader)
+        logger.info(f"[{video_id}] Đã phát hiện loại xe chi tiết cho {n_types}/{len(events)} track.")
+    _cap_shared.release()
+
+    logger.info(f"[{video_id}] BƯỚC 3b: Composite event + quan hệ + vùng (crosswalk) + mật độ + mô tả")
+    composites = detect_composite_events(events)
+    order_relations = detect_order_and_overtake(events)
+    side_by_side_relations = detect_side_by_side(events)
+    collision_candidates = detect_collision_candidates(events)
+    ped_outside_crosswalk = detect_pedestrian_crossing_outside_crosswalk(events, config.CROSSWALK_POLYGON)
+    vehicle_on_crosswalk = detect_vehicle_stopped_on_crosswalk(events, config.CROSSWALK_POLYGON)
+    density_timeline = build_density_timeline(events, duration_sec, bucket_sec=10.0)
+    density_summary = summarize_density(density_timeline)
+
+    # Hướng làn "chuẩn" TỰ HỌC từ chính quỹ đạo đa số xe trong video này (xem
+    # lane_direction.py) -- không cần nhập tay, không cần model AI riêng.
+    # lane_model.n_reliable_cells() == 0 nghĩa là video quá ngắn/ít xe để học
+    # -- lúc đó detect_wrong_way_vehicles() tự trả về [] (không đoán mò).
+    lane_model = LaneDirectionModel()
+    lane_model.fit(events)
+    wrong_way_candidates = detect_wrong_way_vehicles(events, lane_model=lane_model)
+    logger.info(f"[{video_id}] Học hướng làn: {lane_model.n_reliable_cells()} ô lưới tin cậy, "
+                f"{len(wrong_way_candidates)} ứng viên đi sai làn/ngược chiều.")
+
+    descriptions = build_all_descriptions(
+        events, composites,
+        extra_events=ped_outside_crosswalk + vehicle_on_crosswalk + wrong_way_candidates,
+    )
+
+    logger.info(f"[{video_id}] BƯỚC 3c: Mô tả cảnh gộp nhiều xe (scene description) -- "
+                f"'xe A cạnh xe B, đèn X, phía trước có N xe máy'")
+    scene_descriptions = build_scene_descriptions(
+        events, light_lookup=light_lookup,
+        side_by_side=side_by_side_relations, order_relations=order_relations,
+    )
+    logger.info(f"[{video_id}] Đã sinh {len(scene_descriptions)} mô tả cảnh.")
+
+    os.makedirs(out_dir, exist_ok=True)
+    desc_path = os.path.join(out_dir, f"{video_id}_descriptions.json")
+    with open(desc_path, "w", encoding="utf-8") as f:
+        json.dump(descriptions, f, ensure_ascii=False, indent=2)
+
+    scene_desc_path = os.path.join(out_dir, f"{video_id}_scene_descriptions.json")
+    with open(scene_desc_path, "w", encoding="utf-8") as f:
+        json.dump(scene_descriptions, f, ensure_ascii=False, indent=2)
+
+    relations_path = os.path.join(out_dir, f"{video_id}_relations.json")
+    with open(relations_path, "w", encoding="utf-8") as f:
+        json.dump({
+            "order_and_overtake": order_relations,
+            "side_by_side": side_by_side_relations,
+            "collision_candidates": collision_candidates,
+            "pedestrian_crossing_outside_crosswalk": ped_outside_crosswalk,
+            "vehicle_stopped_on_crosswalk": vehicle_on_crosswalk,
+            "wrong_way_candidates": wrong_way_candidates,
+            "lane_direction_model_info": {
+                "n_reliable_cells": lane_model.n_reliable_cells(),
+                "cell_size": lane_model.cell_size,
+                "note": "Số ô lưới học được hướng đa số tin cậy -- 0 nghĩa là video quá ngắn/ít "
+                        "xe để tự học, wrong_way_candidates khi đó luôn rỗng (không đoán mò).",
+            },
+        }, f, ensure_ascii=False, indent=2)
+
+    density_path = os.path.join(out_dir, f"{video_id}_density.json")
+    with open(density_path, "w", encoding="utf-8") as f:
+        json.dump({"timeline": density_timeline, "summary": density_summary}, f, ensure_ascii=False, indent=2)
+
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump([event_to_dict(e) for e in events], f, ensure_ascii=False, indent=2)
+    logger.info(f"[{video_id}] Đã ghi {len(events)} event, {len(descriptions)} mô tả, "
+                f"{len(scene_descriptions)} mô tả cảnh gộp, "
+                f"{len(order_relations)} quan hệ trước/sau-vượt, {len(side_by_side_relations)} quan hệ cạnh nhau, "
+                f"{len(collision_candidates)} ứng viên va chạm, "
+                f"{len(ped_outside_crosswalk)} người băng sai vạch, {len(vehicle_on_crosswalk)} xe dừng đè vạch, "
+                f"{len(wrong_way_candidates)} ứng viên đi sai làn/ngược chiều.")
+
+    if show_demo:
+        demo_queries(events, ocr_cache, duration_sec=duration_for_cache)
+
+    return out_path
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--video_path", type=str, help="Chạy 1 video đơn")
+    group.add_argument("--video_dir", type=str, help="Chạy hàng loạt mọi video trong thư mục này")
+    parser.add_argument("--out_dir", type=str, default="./events",
+                         help="Thư mục ghi kết quả (mỗi video 1 file <video_id>.json)")
+    parser.add_argument("--max_frames", type=int, default=None,
+                         help="Giới hạn số frame detect+track MỖI video để demo nhanh (None = chạy hết)")
+    parser.add_argument("--stride", type=int, default=2,
+                         help="Bỏ bớt frame khi detect+track (2 = xử lý 1/2 số frame)")
+    parser.add_argument("--demo", action="store_true", help="In demo query sau khi xử lý xong")
+    args = parser.parse_args()
+
+    if args.video_path:
+        video_paths = [args.video_path]
+    else:
+        video_paths = sorted(
+            p for p in glob.glob(os.path.join(args.video_dir, "*"))
+            if p.lower().endswith(VIDEO_EXTENSIONS)
+        )
+        if not video_paths:
+            raise SystemExit(f"Không tìm thấy video nào trong {args.video_dir} (đuôi hợp lệ: {VIDEO_EXTENSIONS})")
+        logger.info(f"Tìm thấy {len(video_paths)} video trong {args.video_dir}.")
+
+    results = []
+    for i, vp in enumerate(video_paths):
+        logger.info(f"=== Video {i+1}/{len(video_paths)}: {vp} ===")
+        try:
+            out_path = process_one_video(vp, args.out_dir, args.max_frames, args.stride, show_demo=args.demo)
+            results.append({"video": vp, "status": "ok", "out": out_path})
+        except Exception as e:
+            logger.error(f"LỖI xử lý {vp}: {type(e).__name__}: {e}")
+            results.append({"video": vp, "status": "error", "error": str(e)})
+
+    n_ok = sum(1 for r in results if r["status"] == "ok")
+    logger.info(f"=== HOÀN TẤT: {n_ok}/{len(results)} video xử lý thành công. Kết quả tại {args.out_dir}/ ===")
+    if any(r["status"] == "error" for r in results):
+        logger.warning("Video lỗi:")
+        for r in results:
+            if r["status"] == "error":
+                logger.warning(f"  {r['video']}: {r['error']}")
+
+
+if __name__ == "__main__":
+    main()
