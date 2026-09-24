@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import gc
 import glob
 import json
 import logging
@@ -37,11 +38,69 @@ from vehicle_type_refine import VehicleTypeRefiner, refine_vehicle_types
 from track_dedup import deduplicate_events
 from scene_description import build_scene_descriptions
 import config
+import mem_guard
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("traffic_pipeline.main")
 
 VIDEO_EXTENSIONS = (".mp4", ".mov", ".avi", ".mkv", ".webm")
+
+
+class _ReopeningFrameReader:
+    """Đọc lại frame theo frame_idx bất kỳ (không tuần tự -- _select_representative()
+    trong event_timeline.py chọn frame theo ĐỘ NÉT/KÍCH THƯỚC bbox, không theo
+    thứ tự thời gian, nên gọi frame_reader() nhảy lung tung qua lại nhiều vị
+    trí khác nhau trong video, có thể hàng nghìn lần với video nhiều track).
+
+    NGUYÊN NHÂN RAM TRÀN DẦN ĐÃ XÁC ĐỊNH: seek ngẫu nhiên (cap.set(CAP_PROP_POS_FRAMES))
+    lặp đi lặp lại rất nhiều lần trên CÙNG 1 cv2.VideoCapture, với video .mov/H.264
+    long-GOP, khiến buffer giải mã nội bộ của FFmpeg backend (native C, KHÔNG
+    phải object Python nên gc.collect()/del không giải phóng được) tích lũy
+    dần theo số lần seek -- càng nhiều track/càng về sau video càng nặng, đúng
+    hiện tượng quan sát được (đoạn 5, 6, 7... của cùng 1 video mới bắt đầu tràn).
+
+    FIX (2 LỚP, để KHÔNG phụ thuộc 1 con số cố định):
+    1) LƯỚI AN TOÀN CỐ ĐỊNH: cứ REOPEN_EVERY lần đọc thì đóng/mở lại, bất kể
+       RAM đang cao hay thấp -- phòng trường hợp không đo được RAM (thiếu
+       psutil) thì vẫn có 1 cơ chế dọn tối thiểu.
+    2) TỰ ĐỘNG THEO RAM THẬT (mem_guard.py, ưu tiên hơn, kiểm tra mỗi lần
+       đọc): đo RSS tiến trình / tổng RAM hệ thống qua psutil -- vượt 70%
+       thì đóng/mở lại NGAY dù chưa tới mốc REOPEN_EVERY. Cách này thích
+       nghi được với video ngắn/dài khác nhau và với RAM khác nhau giữa các
+       session Kaggle (29GB bản mới, 13GB bản cũ), thay vì đoán 1 con số
+       đếm cứng có thể sai với video/máy khác.
+
+    Đóng/mở lại VideoCapture là cách DUY NHẤT chắc chắn giải phóng buffer
+    decoder native mà OpenCV/FFmpeg giữ bên trong -- không có API nào khác
+    để "flush" nó khi vẫn dùng chung 1 VideoCapture."""
+
+    REOPEN_EVERY = 300  # lưới an toàn cố định, dùng khi KHÔNG đo được RAM (thiếu psutil)
+
+    def __init__(self, video_path: str, stride: int):
+        self.video_path = video_path
+        self.stride = stride
+        self._cap = cv2.VideoCapture(video_path)
+        self._n_reads = 0
+
+    def _reopen(self):
+        if self._cap is not None:
+            self._cap.release()
+        self._cap = cv2.VideoCapture(self.video_path)
+
+    def read(self, frame_idx: int):
+        freed = mem_guard.free_memory_if_needed(self._reopen, context="_ReopeningFrameReader")
+        if not freed and self._n_reads > 0 and self._n_reads % self.REOPEN_EVERY == 0:
+            self._reopen()
+            gc.collect()
+        self._cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx * self.stride)
+        ok, frame = self._cap.read()
+        self._n_reads += 1
+        return frame if ok else None
+
+    def close(self):
+        if self._cap is not None:
+            self._cap.release()
+            self._cap = None
 
 
 def build_second_level_cache(video_path: str, duration_sec: float):
@@ -62,7 +121,25 @@ def build_second_level_cache(video_path: str, duration_sec: float):
     n_seconds = int(math.ceil(duration_sec))
     logger.info(f"Xây cache OCR + đèn giao thông cho {n_seconds} giây (1 frame/giây)...")
 
+    # Seek tuần tự (mỗi giây 1 lần, luôn tiến về phía trước) ít nghiêm trọng
+    # hơn seek ngẫu nhiên (xem _ReopeningFrameReader ở trên), nhưng với video
+    # rất dài (hàng nghìn giây) vẫn tích lũy buffer decoder native đáng kể
+    # theo cùng cơ chế. Dùng CÙNG 2 lớp bảo vệ: lưới an toàn cố định
+    # (REOPEN_EVERY_SEC) + tự động theo RAM thật đo qua mem_guard.py (ưu
+    # tiên hơn, thích nghi theo video dài/ngắn và RAM thật của session).
+    REOPEN_EVERY_SEC = 300
+    _cap_holder = {"cap": cap}
+
+    def _reopen_ocr_cap():
+        _cap_holder["cap"].release()
+        _cap_holder["cap"] = cv2.VideoCapture(video_path)
+
     for sec in range(n_seconds):
+        freed = mem_guard.free_memory_if_needed(_reopen_ocr_cap, context="build_second_level_cache")
+        if not freed and sec > 0 and sec % REOPEN_EVERY_SEC == 0:
+            _reopen_ocr_cap()
+            gc.collect()
+        cap = _cap_holder["cap"]
         cap.set(cv2.CAP_PROP_POS_FRAMES, int(sec * fps))
         ok, frame = cap.read()
         if not ok:
@@ -72,7 +149,7 @@ def build_second_level_cache(video_path: str, duration_sec: float):
         if sec % 60 == 0:
             logger.info(f"  đã OCR/đèn tới giây {sec}/{n_seconds}")
 
-    cap.release()
+    _cap_holder["cap"].release()
     return ocr_cache, light_cache
 
 
@@ -275,21 +352,36 @@ def process_one_video(video_path: str, out_dir: str, max_frames: Optional[int], 
     # frame_reader: đọc lại đúng frame gốc theo frame_idx (frame_idx đã tính
     # theo stride khi detect+track, xem detect_track.py -- timestamp =
     # frame_idx * stride / fps, nên frame thật trong video tương ứng nằm ở
-    # vị trí frame_idx * stride). Dùng CHUNG 1 VideoCapture (mở 1 lần, seek
-    # nhiều lần) thay vì mở lại mỗi lần gọi -- frame_reader được gọi khá
-    # nhiều lần (chấm điểm chất lượng top-8 detection/track + nhận diện màu
-    # xe), mở lại VideoCapture mỗi lần sẽ chậm đáng kể trên video dài.
-    _cap_shared = cv2.VideoCapture(video_path)
-
-    def _frame_reader(frame_idx: int):
-        _cap_shared.set(cv2.CAP_PROP_POS_FRAMES, frame_idx * stride)
-        ok, frame = _cap_shared.read()
-        return frame if ok else None
+    # vị trí frame_idx * stride). _select_representative() trong
+    # event_timeline.py chọn frame theo ĐỘ NÉT/KÍCH THƯỚC bbox (KHÔNG theo
+    # thứ tự thời gian), nên frame_reader() bị gọi seek NGẪU NHIÊN qua lại
+    # rất nhiều vị trí khác nhau trong video -- với video dài/nhiều track,
+    # có thể tới hàng nghìn lần seek trên CÙNG 1 VideoCapture.
+    #
+    # ĐÃ XÁC ĐỊNH QUA THỰC NGHIỆM: đây là nguyên nhân RAM tăng dần không
+    # giới hạn (buffer giải mã nội bộ của FFmpeg/libavcodec bên trong
+    # VideoCapture tích lũy theo số lần seek ngẫu nhiên qua nhiều GOP khác
+    # nhau -- bộ nhớ NATIVE C, gc.collect()/del KHÔNG giải phóng được, chỉ
+    # có cách đóng hẳn rồi mở lại VideoCapture mới giải phóng). Dùng
+    # _ReopeningFrameReader thay vì 1 VideoCapture mở suốt để tự động đóng
+    # /mở lại định kỳ, chặn tích lũy này -- xem docstring class ở trên.
+    _frame_reader_obj = _ReopeningFrameReader(video_path, stride)
+    _frame_reader = _frame_reader_obj.read
 
     events = build_events_from_tracks(
         detections, video_id=video_id, ocr_lookup=ocr_lookup, light_lookup=light_lookup,
         frame_reader=_frame_reader, color_classifier=color_classifier, pose_estimator=pose_estimator,
     )
+
+    # Giải phóng ngay danh sách Detection thô (1 dòng/đối tượng/frame -- với
+    # video dài có thể hàng trăm nghìn phần tử) VÀ ocr_cache/light_cache (1
+    # entry/giây -- với video dài hàng nghìn giây cũng tích lũy đáng kể)
+    # NGAY SAU KHI build_events_from_tracks() đã trích hết thông tin cần
+    # thiết vào events -- không cần giữ tới cuối hàm nữa. gc.collect() ép
+    # dọn ngay thay vì chờ garbage collector Python tự chạy theo chu kỳ
+    # (mặc định có thể trễ, giữ RAM cao không cần thiết qua các bước sau).
+    del detections, ocr_cache, light_cache
+    gc.collect()
 
     logger.info(f"[{video_id}] BƯỚC 3-dedup: Lọc track trùng lặp (cùng 1 vật thể bị track nhầm nhiều lần -- "
                 f"xem track_dedup.py, phổ biến với vật đứng yên lâu)")
@@ -305,7 +397,8 @@ def process_one_video(video_path: str, out_dir: str, max_frames: Optional[int], 
     if type_refiner is not None:
         n_types = refine_vehicle_types(events, type_refiner, _frame_reader)
         logger.info(f"[{video_id}] Đã phát hiện loại xe chi tiết cho {n_types}/{len(events)} track.")
-    _cap_shared.release()
+    _frame_reader_obj.close()
+    gc.collect()
 
     logger.info(f"[{video_id}] BƯỚC 3b: Composite event + quan hệ + vùng (crosswalk) + mật độ + mô tả")
     composites = detect_composite_events(events)

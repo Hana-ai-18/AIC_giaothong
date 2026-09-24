@@ -17,11 +17,20 @@ import numpy as np
 from ultralytics import YOLO
 
 from config import RELEVANT_CLASSES, VIDEO_PATH
+import mem_guard
 
 logger = logging.getLogger("traffic_pipeline.detect_track")
 
 
-@dataclass
+# slots=True: giảm ~40-50% bộ nhớ mỗi Detection object so với dataclass
+# thường (bỏ __dict__ per-instance, dùng slot cố định) -- QUAN TRỌNG vì đây
+# là nguồn RAM lớn nhất trong cả pipeline khi video dài: `detections` tích
+# lũy TOÀN BỘ danh sách này trong RAM tới khi build_events_from_tracks() xử
+# lý xong (không thể stream theo track vì ByteTrack cần thấy hết trước khi
+# biết track nào dài/ngắn). Với video vài chục nghìn frame x vài chục vật
+# thể/frame, có thể là hàng trăm nghìn tới cả triệu Detection -- slots giúp
+# giảm đáng kể RAM đỉnh mà không đổi bất kỳ logic/API nào ở nơi khác.
+@dataclass(slots=True)
 class Detection:
     frame_idx: int
     timestamp: float
@@ -92,6 +101,13 @@ def run_detection_tracking(
         n_processed += 1
         if n_processed % 100 == 0:
             logger.info(f"  đã xử lý {n_processed} frame ({timestamp:.1f}s), {len(detections)} detection tích lũy")
+            # `detections` PHẢI giữ hết trong RAM tới khi hàm này return
+            # (ByteTrack cần thấy toàn bộ trước khi build_events_from_tracks()
+            # phân track) -- không có cách "dọn giữa chừng" ở đây như
+            # _ReopeningFrameReader, nên chỉ CẢNH BÁO SỚM nếu RAM đã cao,
+            # để người dùng biết cần giảm STRIDE/video ngắn hơn cho lần
+            # chạy tiếp theo, thay vì chỉ phát hiện khi đã tràn/bị OOM-kill.
+            mem_guard.check_and_warn_if_critical(context="run_detection_tracking")
         if max_frames is not None and n_processed >= max_frames:
             logger.info(f"Đạt max_frames={max_frames}, dừng sớm để demo nhanh.")
             break
