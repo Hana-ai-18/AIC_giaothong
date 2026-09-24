@@ -68,6 +68,10 @@ def describe_event(e) -> str:
         else:
             parts.append(f"người lái mặc áo màu {_COLOR_VI[shirt_color]}")
 
+    position_desc = getattr(e, "position_description", None)
+    if position_desc:
+        parts.append(position_desc)
+
     if e.location:
         parts.append(f"tại {e.location}")
 
@@ -140,6 +144,11 @@ def build_all_descriptions(events: List, composites: List[dict], extra_events: O
             "frame_names": e.representative_frame_names,
             "vehicle_color": e.vehicle_color,
             "vehicle_type_detail": getattr(e, "vehicle_type_detail", None),
+            "position_grid_vi": getattr(e, "position_grid_vi", None),
+            "position_grid_en": getattr(e, "position_grid_en", None),
+            "crosswalk_fraction": getattr(e, "crosswalk_fraction", None),
+            "in_crosswalk": getattr(e, "in_crosswalk", False),
+            "position_description": getattr(e, "position_description", None),
         })
     for c in composites:
         out.append({

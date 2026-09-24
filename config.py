@@ -21,6 +21,12 @@ CROP_DATETIME = (900, 0, 1310, 40)   # ngày giờ
 # xác nhận). Nếu camera khác, phải đo lại toạ độ này.
 CROP_TRAFFIC_LIGHT = (1400, 70, 1490, 330)
 
+# Model detect chính: đã đổi từ "yolov8n.pt" (nano) sang "yolov8s.pt" (small)
+# trong detect_track.py để tăng độ chính xác (mAP cao hơn rõ rệt trên COCO
+# val), đối chiếu yêu cầu "mạnh hơn BTC" -- xem giải thích đầy đủ trong
+# docstring đầu detect_track.py. Không cần đổi gì ở đây, model tự tải qua
+# ultralytics khi chạy lần đầu, giống cách "yolov8n.pt" đã tự tải trước đó.
+
 # Class ID trong YOLOv8 (COCO) liên quan tới giao thông.
 VEHICLE_CLASSES = {1: "bicycle", 2: "car", 3: "motorcycle", 5: "bus", 7: "truck"}
 PERSON_CLASS = {0: "person"}
@@ -71,6 +77,19 @@ POSE_MODEL_NAME = "yolov8s-pose.pt"
 # Bật tính năng này (=True) CHỈ KHI đã tự xem lại kết quả bằng mắt
 # (representative_frame_names) và chấp nhận rủi ro false positive còn lại.
 ENABLE_VEHICLE_TYPE_DETAIL = False
+
+# Mở rộng SỐ LOẠI OBJECT nhận diện được (cây/nhà/cửa sổ/bánh xe/lốp/quần áo/
+# đồ chơi...) -- xem scene_context_classes.py. AN TOÀN HƠN nhiều so với
+# ENABLE_VEHICLE_TYPE_DETAIL ở trên: đây chỉ là liệt kê BỐI CẢNH tổng quan
+# của cả video (lấy mẫu vài frame, không gắn nhãn cho track cụ thể nào), nên
+# không có rủi ro "gán sai loại xe cho 1 track thật" như vehicle_type_refine.py
+# đã gặp phải -- MẶC ĐỊNH BẬT. Vẫn dùng chung model YOLOE với
+# ENABLE_VEHICLE_TYPE_DETAIL (VehicleTypeRefiner) nên PHẢI để refiner load
+# được (không phụ thuộc ENABLE_VEHICLE_TYPE_DETAIL đang bật hay tắt -- nếu
+# tắt cả 2, main_pipeline.py vẫn tự load refiner riêng cho scene context nếu
+# cần, xem main_pipeline.py).
+ENABLE_SCENE_CONTEXT_CLASSES = True
+SCENE_CONTEXT_N_SAMPLE_FRAMES = 5  # số frame mẫu rải đều theo thời gian, tăng lên nếu muốn chắc chắn hơn (chậm hơn)
 
 # GHI CHÚ: đã BỎ nhận diện biển số (ALPR) theo yêu cầu -- file plate_ocr.py
 # vẫn còn trong mã nguồn (không xoá) nếu sau này cần bật lại, nhưng KHÔNG

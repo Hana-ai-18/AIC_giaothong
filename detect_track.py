@@ -5,6 +5,28 @@ nhiều frame cho mỗi đối tượng).
 
 Chạy trực tiếp trên video, KHÔNG cần decode thủ công -- ultralytics tự đọc
 video qua OpenCV nội bộ, xử lý từng frame, trả generator kết quả.
+
+DÙNG `yolov8s.pt` (small) THAY VÌ `yolov8n.pt` (nano, mặc định cũ) -- ĐÃ ĐỔI
+để tăng độ chính xác detect, đối chiếu yêu cầu "mạnh hơn BTC": nano là bản
+NHẸ/NHANH NHẤT trong họ YOLOv8 nhưng đánh đổi bằng recall/precision thấp
+nhất (dễ bỏ sót object nhỏ/xa, dễ nhầm class khi vật thể bị che khuất một
+phần) -- theo benchmark công bố của Ultralytics trên COCO val, `yolov8s` có
+mAP cao hơn `yolov8n` rõ rệt (~44.9 so với ~37.3 mAP50-95) trong khi vẫn
+chạy realtime được trên GPU T4 của Kaggle (chậm hơn nano nhưng không đáng
+kể so với tổng thời gian pipeline, vốn đã bottleneck ở OCR/pose/color chứ
+không phải riêng detect). Nếu cần chính xác hơn nữa và chấp nhận chậm hơn,
+đổi thành "yolov8m.pt" (medium, mAP ~50.2) -- không khuyến nghị "yolov8l/x"
+trên CPU/Kaggle free-tier vì quá chậm cho việc chạy hàng loạt nhiều video.
+
+`conf_threshold` HẠ TỪ 0.35 XUỐNG 0.25 -- ngưỡng 0.35 cũ bỏ sót một số
+object có confidence trung bình (đặc biệt xe/người ở xa, một phần bị che
+khuất), nhưng hạ ngưỡng đơn thuần dễ tăng false positive nếu KHÔNG có lọc
+hậu kỳ đi kèm. Đã có sẵn 2 lớp lọc hậu kỳ trong pipeline giảm rủi ro này:
+(1) MIN_EVENT_DURATION_SEC (config.py) loại track quá ngắn (dấu hiệu nhiễu
+detect chớp nhoáng thường có confidence thấp gần ngưỡng), (2) track_dedup.py
+gộp/loại track trùng lặp. Nếu sau khi chạy thật thấy false positive tăng rõ
+rệt (nhiều track rất ngắn, avg_conf sát 0.25), nên tăng lại về 0.3 thay vì
+0.35 (điểm cân bằng giữa 2 lần thử).
 """
 from __future__ import annotations
 
@@ -43,8 +65,8 @@ class Detection:
 
 def run_detection_tracking(
     video_path: str = VIDEO_PATH,
-    model_name: str = "yolov8n.pt",
-    conf_threshold: float = 0.35,
+    model_name: str = "yolov8s.pt",
+    conf_threshold: float = 0.25,
     frame_stride: int = 1,
     max_frames: Optional[int] = None,
     device: str = "cpu",

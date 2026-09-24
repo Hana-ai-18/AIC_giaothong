@@ -35,6 +35,7 @@ from zone_events import detect_pedestrian_crossing_outside_crosswalk, detect_veh
 from density_timeline import build_density_timeline, summarize_density
 from lane_direction import LaneDirectionModel, detect_wrong_way_vehicles
 from vehicle_type_refine import VehicleTypeRefiner, refine_vehicle_types
+from scene_context_classes import detect_scene_context
 from track_dedup import deduplicate_events
 from scene_description import build_scene_descriptions
 import config
@@ -310,12 +311,17 @@ def _get_pose_estimator():
     return _POSE_ESTIMATOR
 
 
-def _get_type_refiner():
+def _get_type_refiner(force: bool = False):
+    """force=True: load refiner (dùng chung YOLOE model) BẤT KỂ
+    ENABLE_VEHICLE_TYPE_DETAIL đang bật/tắt -- cần cho scene_context_classes.py
+    (ENABLE_SCENE_CONTEXT_CLASSES độc lập với ENABLE_VEHICLE_TYPE_DETAIL, xem
+    config.py) vì 2 tính năng này dùng CHUNG 1 model YOLOE để tránh tải model
+    2 lần, nhưng có thể bật/tắt riêng từng cái."""
     global _TYPE_REFINER
-    if not getattr(config, "ENABLE_VEHICLE_TYPE_DETAIL", True):
+    if not force and not getattr(config, "ENABLE_VEHICLE_TYPE_DETAIL", True):
         return None
     if _TYPE_REFINER is None:
-        logger.info("Đang load model YOLOE (nhận diện loại xe chi tiết -- ambulance/xe ba gác/...)...")
+        logger.info("Đang load model YOLOE (dùng chung cho loại xe chi tiết + class bối cảnh phụ)...")
         _TYPE_REFINER = VehicleTypeRefiner()
     return _TYPE_REFINER
 
@@ -397,6 +403,20 @@ def process_one_video(video_path: str, out_dir: str, max_frames: Optional[int], 
     if type_refiner is not None:
         n_types = refine_vehicle_types(events, type_refiner, _frame_reader)
         logger.info(f"[{video_id}] Đã phát hiện loại xe chi tiết cho {n_types}/{len(events)} track.")
+
+    logger.info(f"[{video_id}] BƯỚC 3a-2: Mở rộng phạm vi class bối cảnh (cây/nhà/cửa sổ/bánh xe/..., "
+                f"đối chiếu mẫu BTC N001-V001.zip) -- chỉ lấy mẫu vài frame, KHÔNG gắn vào track cụ thể")
+    scene_context = {}
+    if getattr(config, "ENABLE_SCENE_CONTEXT_CLASSES", True):
+        context_refiner = type_refiner if type_refiner is not None else _get_type_refiner(force=True)
+        n_context_sample_frames = getattr(config, "SCENE_CONTEXT_N_SAMPLE_FRAMES", 5)
+        scene_context = detect_scene_context(
+            context_refiner, _frame_reader, n_total_frames=int(total_frames),
+            n_samples=n_context_sample_frames,
+        )
+        logger.info(f"[{video_id}] Đã phát hiện {len(scene_context)} loại bối cảnh phụ "
+                    f"(vd cây/nhà/cửa sổ) trong {n_context_sample_frames} frame mẫu.")
+
     _frame_reader_obj.close()
     gc.collect()
 
@@ -441,6 +461,12 @@ def process_one_video(video_path: str, out_dir: str, max_frames: Optional[int], 
     scene_desc_path = os.path.join(out_dir, f"{video_id}_scene_descriptions.json")
     with open(scene_desc_path, "w", encoding="utf-8") as f:
         json.dump(scene_descriptions, f, ensure_ascii=False, indent=2)
+
+    # File RIÊNG, KHÔNG gộp vào events chính -- xem docstring scene_context_classes.py
+    # về lý do tách biệt (bối cảnh tĩnh không gắn với track_id nào cụ thể).
+    scene_context_path = os.path.join(out_dir, f"{video_id}_scene_context.json")
+    with open(scene_context_path, "w", encoding="utf-8") as f:
+        json.dump(scene_context, f, ensure_ascii=False, indent=2)
 
     relations_path = os.path.join(out_dir, f"{video_id}_relations.json")
     with open(relations_path, "w", encoding="utf-8") as f:

@@ -33,7 +33,8 @@ import polars as pl
 # dùng để loại chúng ra khi glob "*.json" tìm file event, và để tự suy ra
 # tên file liên quan (descriptions/relations/scene_descriptions) từ mỗi
 # video_id tìm được.
-_AUX_SUFFIXES = ("_descriptions.json", "_scene_descriptions.json", "_relations.json", "_density.json")
+_AUX_SUFFIXES = ("_descriptions.json", "_scene_descriptions.json", "_relations.json", "_density.json",
+                  "_scene_context.json")
 
 
 def _find_event_files(out_dir: str) -> List[str]:
@@ -121,7 +122,21 @@ def build_index_for_video(out_dir: str, video_id: str) -> List[Dict]:
             "vehicle_type_detail_conf": (e.get("vehicle_type_detail") or {}).get("confidence"),
             "merged_from_track_ids": json.dumps(e.get("merged_from_track_ids")) if e.get("merged_from_track_ids") else None,
             "merge_note": e.get("merge_note"),
+            "position_grid_vi": e.get("position_grid_vi"),
+            "position_grid_en": e.get("position_grid_en"),
+            "crosswalk_fraction": e.get("crosswalk_fraction"),
+            "in_crosswalk": e.get("in_crosswalk"),
+            "position_description": e.get("position_description"),
             "representative_frame_names": json.dumps(e.get("representative_frame_names") or []),
+            # Quỹ đạo đầy đủ (đã downsample sẵn, tối đa 20 điểm/track, xem
+            # event_timeline.py::_downsample_trajectory) -- LƯU THÊM vào
+            # index để các converter/tool khác (vd
+            # convert_traffic_to_object_index.py, ghép sang schema
+            # aic26_pipeline) có bbox pixel thật của từng điểm thời gian,
+            # không phải suy đoán/để trống. Trước đây field này CÓ trong
+            # Event nhưng KHÔNG được xuất ra parquet, khiến các converter
+            # khác không có bbox thật để dùng.
+            "trajectory": json.dumps(e.get("trajectory") or []),
             "description": desc_by_track.get(tid),
             "scene_descriptions": json.dumps(scene_by_track.get(tid, [])),
             "relations": json.dumps(_relations_for_track(relations, tid)),
@@ -143,7 +158,10 @@ INDEX_SCHEMA = {
     "shirt_color": pl.Utf8, "shirt_color_conf": pl.Float64, "shirt_color_method": pl.Utf8,
     "vehicle_type_detail_en": pl.Utf8, "vehicle_type_detail_vi": pl.Utf8, "vehicle_type_detail_conf": pl.Float64,
     "merged_from_track_ids": pl.Utf8, "merge_note": pl.Utf8,
-    "representative_frame_names": pl.Utf8, "description": pl.Utf8,
+    "position_grid_vi": pl.Utf8, "position_grid_en": pl.Utf8,
+    "crosswalk_fraction": pl.Float64, "in_crosswalk": pl.Boolean,
+    "position_description": pl.Utf8,
+    "representative_frame_names": pl.Utf8, "trajectory": pl.Utf8, "description": pl.Utf8,
     "scene_descriptions": pl.Utf8, "relations": pl.Utf8,
 }
 

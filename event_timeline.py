@@ -20,8 +20,9 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
 from detect_track import Detection
-from config import MIN_EVENT_DURATION_SEC, FRAME_WIDTH, FRAME_HEIGHT
+from config import MIN_EVENT_DURATION_SEC, FRAME_WIDTH, FRAME_HEIGHT, CROSSWALK_POLYGON
 from frame_quality import quality_score
+from frame_position import describe_position
 
 logger = logging.getLogger("traffic_pipeline.event_timeline")
 
@@ -89,6 +90,16 @@ class Event:
     shirt_color: Optional[str] = None
     shirt_color_conf: Optional[float] = None
     shirt_color_method: Optional[str] = None
+    # Vị trí ngữ nghĩa trong khung hình (frame_position.py) -- bổ sung theo
+    # yêu cầu "nhận diện vị trí vật kỹ càng", đối chiếu mẫu BTC N001-V001.zip
+    # (chỉ có bbox thô, không có mô tả vị trí gì thêm). Tính từ trajectory đã
+    # downsample ở trên, KHÔNG cần frame_reader/model nào thêm -- luôn có giá
+    # trị (trừ khi track không có điểm quỹ đạo nào, cực hiếm).
+    position_grid_vi: Optional[str] = None   # vd "chính giữa khung hình", "góc trên bên trái"
+    position_grid_en: Optional[str] = None   # vd "center", "top-left"
+    crosswalk_fraction: Optional[float] = None  # % điểm quỹ đạo nằm trong vùng vạch sang đường
+    in_crosswalk: bool = False
+    position_description: Optional[str] = None  # câu tiếng Việt gộp cả 2 lớp thông tin trên
 
 
 def _frame_name(video_id: str, timestamp_sec: float) -> str:
@@ -289,6 +300,8 @@ def build_events_from_tracks(
 
         trajectory = _downsample_trajectory(dets)
 
+        pos = describe_position(trajectory, FRAME_WIDTH, FRAME_HEIGHT, CROSSWALK_POLYGON)
+
         events.append(Event(
             video_id=video_id, track_id=track_id, cls_name=cls_name,
             t_start=round(t_start, 2), t_end=round(t_end, 2),
@@ -301,6 +314,9 @@ def build_events_from_tracks(
             vehicle_color=vcolor, vehicle_color_conf=vcolor_conf, vehicle_color_method=vcolor_method,
             shirt_color=scolor, shirt_color_conf=scolor_conf, shirt_color_method=scolor_method,
             trajectory=trajectory,
+            position_grid_vi=pos["grid_position_vi"], position_grid_en=pos["grid_position_en"],
+            crosswalk_fraction=pos["crosswalk_fraction"], in_crosswalk=pos["in_crosswalk"],
+            position_description=pos["position_description"],
         ))
 
     events.sort(key=lambda e: e.t_start)
